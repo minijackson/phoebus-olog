@@ -63,7 +63,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
-import java.util.SortedSet;
+import java.util.TreeSet;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -331,22 +331,19 @@ public class LogResource {
         Log newLogEntry = createLog(clientInfo, markup, inReplyTo, logEntry, principal);
 
         if (files != null) {
+            List<Attachment> savedAttachments = new ArrayList<>();
             for (MultipartFile multipartFile : multipartFiles) {
                 String originalFileName = multipartFile.getOriginalFilename();
                 Optional<Attachment> attachment =
                         logEntry.getAttachments().stream()
                                 .filter(a -> a.getFilename() != null && a.getFilename().equals(originalFileName)).findFirst();
-                if (attachment.isEmpty()) { // Should not happen if client behaves correctly
-                    logger.log(Level.WARNING, () -> MessageFormat.format(TextUtil.ATTACHMENT_FILE_NOT_MATCHED_META_DATA, originalFileName));
-                    continue;
-                }
-
-                saveAttachment(Long.toString(newLogEntry.getId()),
-                        multipartFile,
+                savedAttachments.add(saveAttachment(multipartFile,
                         originalFileName,
                         attachment.get().getId(),
-                        attachment.get().getFileMetadataDescription());
+                        attachment.get().getFileMetadataDescription()));
             }
+            newLogEntry.setAttachments(new TreeSet<>(savedAttachments));
+            logRepository.update(newLogEntry);
         }
 
         logger.log(Level.INFO, () -> MessageFormat.format(TextUtil.LOG_ENTRY_ID_CREATED_FROM, newLogEntry.getId(), clientInfo));
@@ -358,34 +355,23 @@ public class LogResource {
     /**
      * Saves the content of the {@link MultipartFile} to the database.
      *
-     * @param logId                   The log id associated with the attachment
      * @param file                    A {@link MultipartFile} representing the attachment contents
      * @param filename                The file name as defined by the client, e.g. file name on disk.
      * @param id                      A unique id for the attachment.
      * @param fileMetadataDescription Description of the content
-     * @return A {@link Log} where the attachment field has been updated with the saved attachment.
+     * @return A {@link Attachment} object representing the saved file.
      */
-    private Log saveAttachment(String logId,
-                               MultipartFile file,
-                               String filename,
-                               String id,
-                               String fileMetadataDescription) {
-        Optional<Log> foundLog = logRepository.findById(logId);
-        if (logRepository.findById(logId).isPresent()) {
-            filename = filename == null || filename.isEmpty() ? file.getName() : filename;
-            fileMetadataDescription = fileMetadataDescription == null || fileMetadataDescription.isEmpty()
-                    ? file.getContentType()
-                    : fileMetadataDescription;
-            Attachment attachment = new Attachment(id, file, filename, fileMetadataDescription);
-            // Store the attachment
-            Attachment createdAttachment = attachmentRepository.save(attachment);
-            SortedSet<Attachment> existingAttachments = foundLog.get().getAttachments();
-            existingAttachments.add(createdAttachment);
-            foundLog.get().setAttachments(existingAttachments);
-            return logRepository.update(foundLog.get());
-        } else {
-            throw new ResponseStatusException(HttpStatus.NOT_FOUND, MessageFormat.format(TextUtil.LOG_NOT_RETRIEVED, logId));
-        }
+    private Attachment saveAttachment(MultipartFile file,
+                                      String filename,
+                                      String id,
+                                      String fileMetadataDescription) {
+        filename = filename == null || filename.isEmpty() ? file.getName() : filename;
+        fileMetadataDescription = fileMetadataDescription == null || fileMetadataDescription.isEmpty()
+                ? file.getContentType()
+                : fileMetadataDescription;
+        Attachment attachment = new Attachment(id, file, filename, fileMetadataDescription);
+        // Store the attachment
+        return attachmentRepository.save(attachment);
     }
 
     /**
@@ -698,13 +684,14 @@ public class LogResource {
      *     <li>Multipart file count must be equal to attachment count.</li>
      *     <li>For each multipart file the original file name must match exactly one attachment's filename.</li>
      * </ul>
-     * @param logEntry Log entry with attachments
+     *
+     * @param logEntry       Log entry with attachments
      * @param multipartFiles An array of {@link MultipartFile}s as provided by the web layer.
      * @return <code>true</code> if attachments data is consistent, otherwise <code>false</code>
      */
     protected boolean isAttachmentUploadConsistent(Log logEntry, MultipartFile[] multipartFiles) {
 
-        if(multipartFiles != null && multipartFiles.length == logEntry.getAttachments().size()){
+        if (multipartFiles != null && multipartFiles.length == logEntry.getAttachments().size()) {
             for (MultipartFile multipartFile : multipartFiles) {
                 String originalFileName = multipartFile.getOriginalFilename();
 
@@ -717,64 +704,56 @@ public class LogResource {
                 }
             }
             return true;
-        }
-        else {
+        } else {
             return multipartFiles == null && logEntry.getAttachments().isEmpty();
         }
     }
 
     /**
-     * A {@link MultipartFile} implementation with the purpose of providing a custom {@link InputStream}.
-     */
-    private static final class OlogMultipartFile implements MultipartFile {
-
-        private final MultipartFile originalMultipartFile;
-        private final InputStream inputStream;
-
-        public OlogMultipartFile(MultipartFile originalMultipartFile, InputStream inputStream) {
-            this.originalMultipartFile = originalMultipartFile;
-            this.inputStream = inputStream;
-        }
+         * A {@link MultipartFile} implementation with the purpose of providing a custom {@link InputStream}.
+         */
+        private record OlogMultipartFile(MultipartFile originalMultipartFile,
+                                         InputStream inputStream) implements MultipartFile {
 
         @Override
-        public String getName() {
-            return originalMultipartFile.getName();
-        }
+            public String getName() {
+                return originalMultipartFile.getName();
+            }
 
-        @Override
-        public String getOriginalFilename() {
-            return originalMultipartFile.getOriginalFilename();
-        }
+            @Override
+            public String getOriginalFilename() {
+                return originalMultipartFile.getOriginalFilename();
+            }
 
-        @Override
-        public String getContentType() {
-            return originalMultipartFile.getContentType();
-        }
+            @Override
+            public String getContentType() {
+                return originalMultipartFile.getContentType();
+            }
 
-        @Override
-        public boolean isEmpty() {
-            return originalMultipartFile.isEmpty();
-        }
+            @Override
+            public boolean isEmpty() {
+                return originalMultipartFile.isEmpty();
+            }
 
-        @Override
-        public long getSize() {
-            return originalMultipartFile.getSize();
-        }
+            @Override
+            public long getSize() {
+                return originalMultipartFile.getSize();
+            }
 
-        @Override
-        public byte[] getBytes() throws IOException {
-            return originalMultipartFile.getBytes();
-        }
+            @Override
+            public byte[] getBytes() throws IOException {
+                return originalMultipartFile.getBytes();
+            }
 
-        @Override
-        public InputStream getInputStream() {
-            return inputStream;
-        }
+            @Override
+            public InputStream getInputStream() {
+                return inputStream;
+            }
 
-        @Override
-        public void transferTo(File dest) throws IOException, IllegalStateException {
-            originalMultipartFile.transferTo(dest);
+            @Override
+            public void transferTo(File dest) throws IOException, IllegalStateException {
+                originalMultipartFile.transferTo(dest);
+            }
         }
-    }
 
 }
