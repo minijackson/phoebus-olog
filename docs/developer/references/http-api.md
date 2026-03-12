@@ -9,7 +9,6 @@ Create a log entry
 
 ```json
 {
-   "owner":"log",
      "description":"Beam Dump due to Major power dip Current Alarms Booster transmitter switched back to lower state.",
      "level":"Info",
      "title":"Some title",
@@ -25,15 +24,21 @@ Create a log entry
 }
 ```
 
-**NOTE** Attachment ids must be unique, e.g. UUID. When creating a log entry - optionally with attachments - client **must**:
+**NOTE** Attachment ids **must** be unique, e.g. UUID. When creating a log entry - optionally with attachments - client **must**:
 
 1. Use a multipart request and set the Content-Type to "multipart/form-data", even if no attachments are present.
+2. If attachments are present: add one request part per attachment file. Each
+file **must** be added using "files" as the name for the part.
+3. The filename field of an attachment **must** match the originalFilename of the file part. This requirement ensures
+that attachment metadata and file parts can be matched. Note that a client may set
+an arbitrary originalFilename, it need not match the file name of the physical file subject to upload.
+4. To support upload of files with same name, but from different directories, the filename field should be unique between
+all attachments/files uploaded in a log entry submission.
+5. Add the log entry as a request part with content type "application/json". The name of the part **must** be "logEntry".
 
-#. If attachments are present: add one request part per attachment file, in the order they appear in the log entry. Each
-file must be added using "files" as the name for the part.
-#. Add the log entry as a request part with content type "application/json". The name of the part must be "logEntry".
+An HTTP 400 (bad request) is returned if a file part is present that does not correspond to any of the attachment objects.
 
-Client must also be prepared to handle a HTTP 413 (payload too large) response in case the attached files exceed
+Client must also be prepared to handle an HTTP 413 (payload too large) response in case the attached files exceed
 file and request size limits configured in the service.
 
 ## Reply to a log entry
@@ -133,9 +138,10 @@ Find entries with at least one attachment of type 'image'
 
 **POST** <https://localhost:8181/Olog/logs>/\{logId}
 
-Update a log entry, the orginal log entry is archived in a seperate elastic index before any of the changes are applied.
+Update a log entry, the original log entry is archived in a separate elastic index before any of the changes are applied.
+This endpoint does not support upload of addtional attachments.
 
-Note: the create date, attachments, and events cannot be modified.
+Note: the create date, and events cannot be modified.
 
 ```json
 {
@@ -151,6 +157,42 @@ Note: the create date, attachments, and events cannot be modified.
      ]
 }
 ```
+
+## Updating a Log Entry with additional attachments
+
+**POST** <https://localhost:8181/Olog/logs/multipart>
+
+Update a log entry, the original log entry is archived in a separate elastic index before any of the changes are applied.
+
+Note: the create date, and events cannot be modified.
+
+```json
+{
+  "description":"Beam Dump due to Major power dip Current Alarms Booster transmitter switched back to lower state.",
+  "level":"Info",
+  "title":"Some title",
+  "logbooks":[
+    {
+      "name":"Operations"
+    }
+  ],
+  "attachments":[
+    {"id": "82dd67fa-09df-11ee-be56-0242ac120002", "filename":"MyScreenShot.png"},
+    {"id": "c02948ad-4bbd-432f-aa4d-a687a54f8d40", "filename":"MySpreadsheet.xlsx"}
+}
+```
+Please check the documentation for
+
+**PUT** <https://localhost:8181/Olog/logs/multipart>
+
+on restrictions and requirements on the multipart request.
+
+An HTTP 400 (bad request) is returned in the following cases:
+
+- If a file part is present that does not correspond to any of the attachment objects.
+- If an attachment object does not correspond to any file part **and** if that attachment (identified by the id field) 
+cannot be located in the attachment repository.
+
 
 ## Managing Logbooks, Tags and Levels
 

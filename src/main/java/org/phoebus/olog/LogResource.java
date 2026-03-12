@@ -1,6 +1,7 @@
 /*
  * Copyright (c) 2010-2020 Brookhaven National Laboratory
  * Copyright (c) 2010-2020 Helmholtz-Zentrum Berlin für Materialien und Energie GmbH
+ * Copyright (C) 2026 European Spallation Source ERIC.
  * All rights reserved. Use is subject to license terms and conditions.
  */
 package org.phoebus.olog;
@@ -8,8 +9,6 @@ package org.phoebus.olog;
 import jakarta.servlet.http.HttpServletRequest;
 import org.apache.commons.collections4.CollectionUtils;
 import org.apache.tika.detect.Detector;
-import org.apache.tika.metadata.Metadata;
-import org.apache.tika.metadata.TikaCoreProperties;
 import org.phoebus.olog.entity.Attachment;
 import org.phoebus.olog.entity.Log;
 import org.phoebus.olog.entity.LogEntryGroupHelper;
@@ -48,10 +47,7 @@ import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.multipart.MultipartFile;
 import org.springframework.web.server.ResponseStatusException;
 
-import java.io.BufferedInputStream;
-import java.io.File;
 import java.io.IOException;
-import java.io.InputStream;
 import java.security.Principal;
 import java.text.MessageFormat;
 import java.time.Duration;
@@ -122,6 +118,9 @@ public class LogResource {
 
     @Autowired
     private Detector detector;
+
+    @Autowired
+    private AttachmentsUploadUtil attachmentsUploadUtil;
 
     /**
      * Custom HTTP header that client may send in order to identify itself. This is logged for some of the
@@ -249,6 +248,7 @@ public class LogResource {
     @PutMapping()
     public Log createLog(@RequestHeader(value = OLOG_CLIENT_INFO_HEADER, required = false, defaultValue = "n/a") String clientInfo,
                          @RequestParam(name = "markup", required = false) String markup,
+                         @RequestParam(name = "notifyWsClients", required = false, defaultValue = "true") boolean notifyWsClients,
                          @RequestParam(name = "inReplyTo", required = false, defaultValue = "-1") String inReplyTo,
                          @RequestBody Log log,
                          @AuthenticationPrincipal Principal principal) {
@@ -282,7 +282,9 @@ public class LogResource {
         Log newLogEntry = logRepository.save(log);
         sendToNotifiers(newLogEntry);
 
-        webSocketService.sendMessageToClients(new WebSocketMessage(MessageType.NEW_LOG_ENTRY, null));
+        if (notifyWsClients) {
+            webSocketService.sendMessageToClients(new WebSocketMessage(MessageType.NEW_LOG_ENTRY, null));
+        }
 
         logger.log(Level.INFO, () -> "Entry id " + newLogEntry.getId() + " created from " + clientInfo);
 
@@ -316,41 +318,40 @@ public class LogResource {
                          @RequestPart(value = "files", required = false) MultipartFile[] files,
                          @AuthenticationPrincipal Principal principal) {
 
-        if (!isAttachmentUploadConsistent(logEntry, files)) {
+        if (!attachmentsUploadUtil.isAttachmentUploadConsistent(logEntry, files)) {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, TextUtil.ATTACHMENT_DATA_INVALID);
         }
 
-        List<MultipartFile> multipartFiles;
-
-        try {
-            multipartFiles = checkSupportedAttachmentTypes(files);
-        } catch (IllegalArgumentException exception) {
-            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, TextUtil.ATTACHMENT_HEIC_NOT_SUPPORTED);
-        }
-
-        Log newLogEntry = createLog(clientInfo, markup, inReplyTo, logEntry, principal);
+        List<MultipartFile> multipartFiles = null;
 
         if (files != null) {
-            List<Attachment> savedAttachments = new ArrayList<>();
-            for (MultipartFile multipartFile : multipartFiles) {
-                String originalFileName = multipartFile.getOriginalFilename();
-                Optional<Attachment> attachment =
-                        logEntry.getAttachments().stream()
-                                .filter(a -> a.getFilename() != null && a.getFilename().equals(originalFileName)).findFirst();
-                savedAttachments.add(saveAttachment(multipartFile,
-                        originalFileName,
-                        attachment.get().getId(),
-                        attachment.get().getFileMetadataDescription()));
+            try {
+                multipartFiles = attachmentsUploadUtil.checkSupportedAttachmentTypes(files);
+            } catch (IllegalArgumentException exception) {
+                throw new ResponseStatusException(HttpStatus.BAD_REQUEST, TextUtil.ATTACHMENT_HEIC_NOT_SUPPORTED);
             }
-            newLogEntry.setAttachments(new TreeSet<>(savedAttachments));
-            logRepository.update(newLogEntry);
         }
 
-        logger.log(Level.INFO, () -> MessageFormat.format(TextUtil.LOG_ENTRY_ID_CREATED_FROM, newLogEntry.getId(), clientInfo));
+        // Attachments consistency checked, safe to create log entry
+        Log newLogEntry = createLog(clientInfo, markup, false, inReplyTo, logEntry, principal);
+
+        if (files != null) {
+            try {
+                List<Attachment> savedAttachments = saveAttachments(logEntry, multipartFiles);
+                newLogEntry.setAttachments(new TreeSet<>(savedAttachments));
+                newLogEntry = logRepository.update(newLogEntry);
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+        }
+
+        Long id = newLogEntry.getId();
+        webSocketService.sendMessageToClients(new WebSocketMessage(MessageType.NEW_LOG_ENTRY, null));
+
+        logger.log(Level.INFO, () -> MessageFormat.format(TextUtil.LOG_ENTRY_ID_CREATED_FROM, id, clientInfo));
 
         return newLogEntry;
     }
-
 
     /**
      * Saves the content of the {@link MultipartFile} to the database.
@@ -384,10 +385,13 @@ public class LogResource {
      * </ul>
      * Notifiers - if such have been registered - are not called.
      *
-     * @param logId     The log id of the entry subject to update. It must exist, i.e. it is not created of not found.
-     * @param markup    Markup strategy, if any.
-     * @param log       The log record data as sent by client.
-     * @param principal The authenticated {@link Principal} of the request.
+     * @param logId           The log id of the entry subject to update. It must exist, i.e. it is not created of not found.
+     * @param markup          Markup strategy, if any.
+     * @param notifyWsClients Optional flag indicating if websocket clients should be notified when update is completed. Defaults
+     *                        to <code>true</code> (in a REST call), but since this method is also called from another
+     *                        endpoint it would be <code>false</code> to avoid multiple notifications.
+     * @param log             The log record data as sent by client.
+     * @param principal       The authenticated {@link Principal} of the request.
      * @return The updated log record, or HTTP status 404 if the log record does not exist. If the path
      * variable does not match the id in the log record, HTTP status 400 (bad request) is returned.
      */
@@ -395,6 +399,7 @@ public class LogResource {
     @PostMapping("/{logId}")
     public Log updateLog(@PathVariable(name = "logId") String logId,
                          @RequestParam(name = "markup", required = false) String markup,
+                         @RequestParam(name = "notifyWsClients", required = false, defaultValue = "true") boolean notifyWsClients,
                          @RequestBody Log log,
                          @AuthenticationPrincipal Principal principal) {
 
@@ -429,12 +434,64 @@ public class LogResource {
             persistedLog.setTitle(log.getTitle());
             persistedLog = cleanMarkup(markup, persistedLog);
 
-            webSocketService.sendMessageToClients(new WebSocketMessage(MessageType.LOG_ENTRY_UPDATED, persistedLog.getId().toString()));
-
-            return logRepository.update(persistedLog);
+            Log updatedLog = logRepository.update(persistedLog);
+            if (notifyWsClients) {
+                webSocketService.sendMessageToClients(new WebSocketMessage(MessageType.LOG_ENTRY_UPDATED, persistedLog.getId().toString()));
+            }
+            return updatedLog;
         } else {
             throw new ResponseStatusException(HttpStatus.NOT_FOUND, MessageFormat.format(TextUtil.LOG_NOT_RETRIEVED, logId));
         }
+    }
+
+    @PostMapping("/multipart")
+    public Log updateLog(@RequestParam(name = "markup", required = false) String markup,
+                         @RequestPart("logEntry") Log logEntry,
+                         @RequestPart(value = "files", required = false) MultipartFile[] files,
+                         @AuthenticationPrincipal Principal principal) {
+        if (logEntry == null || logEntry.getId() == null || logEntry.getId() < 0) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, TextUtil.LOG_ENTRY_ID_MISSING);
+        }
+
+        if (!attachmentsUploadUtil.isAttachmentUploadConsistent(logEntry, files)) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, TextUtil.ATTACHMENT_DATA_INVALID);
+        }
+
+        Optional<Log> exitingLogEntryOptional = logRepository.findById(Long.toString(logEntry.getId()));
+        if (exitingLogEntryOptional.isEmpty()) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
+                    MessageFormat.format(TextUtil.LOG_NOT_FOUND, logEntry.getId()));
+        }
+
+        // Check if additional attachments are uploaded correctly
+        List<MultipartFile> multipartFiles = null;
+
+        if (files != null) {
+            try {
+                multipartFiles = attachmentsUploadUtil.checkSupportedAttachmentTypes(files);
+            } catch (IllegalArgumentException exception) {
+                throw new ResponseStatusException(HttpStatus.BAD_REQUEST, TextUtil.ATTACHMENT_HEIC_NOT_SUPPORTED);
+            }
+        }
+
+        // Update editable portions of the log entry, except attachments
+        Log updatedLog = updateLog(Long.toString(logEntry.getId()),
+                markup,
+                false,
+                logEntry,
+                principal);
+
+        //And then save the new attachments
+        if (files != null) {
+            List<Attachment> savedAttachments = saveAttachments(logEntry, multipartFiles);
+            updatedLog.getAttachments().addAll(new TreeSet<>(savedAttachments));
+            updatedLog = logRepository.update(updatedLog);
+        }
+
+        webSocketService.sendMessageToClients(new WebSocketMessage(MessageType.LOG_ENTRY_UPDATED, updatedLog.getId().toString()));
+
+        return updatedLog;
+
     }
 
     @SuppressWarnings("unused")
@@ -638,122 +695,32 @@ public class LogResource {
     }
 
     /**
-     * For each {@link MultipartFile} in the provided list, this method will check the type of attachment in order
-     * to be able to reject unsupported types (e.g. HEIC image files). As it operates on the {@link InputStream} provided
-     * through a {@link MultipartFile}, and in order to be able to consume that stream again when saving to
-     * the attachments database, the original {@link MultipartFile} is cloned to a new one where the {@link InputStream}
-     * is wrapped in a {@link BufferedInputStream}.
+     * Saves {@link Attachment}s to the repository.
      * <p>
-     * The analysis of content type is delegated to Apache Tika. If an unsupported content type is encountered,
-     * this methid throws an {@link IllegalArgumentException}.
+     * <b>NOTE</b> before calling this callee needs to ensure that the provided parameters are
+     * checked for consistency.
      * </p>
      *
-     * @param multipartFiles Array of {@link MultipartFile}s from client as intercepted by the endpoint.
-     * @return A {@link List} of {@link MultipartFile}s where the {@link InputStream} can be consumed again.
-     * @throws IllegalArgumentException if an unsupported content type is encontered.
-     *
+     * @param logEntry       A log entry inlcuding {@link Attachment}s
+     * @param multipartFiles The fils uploaded by client
+     * @return A {@link List} of {@link Attachment}s representing the persisted attachment files.
      */
-    protected List<MultipartFile> checkSupportedAttachmentTypes(MultipartFile[] multipartFiles) {
-        if (multipartFiles == null || multipartFiles.length == 0) {
-            return null;
-        }
+    protected List<Attachment> saveAttachments(Log logEntry, List<MultipartFile> multipartFiles) {
+        List<Attachment> savedAttachments = new ArrayList<>();
 
-        List<MultipartFile> attachmentFiles = new ArrayList<>();
         for (MultipartFile multipartFile : multipartFiles) {
-            try {
-                Metadata metadata = new Metadata();
-                metadata.add(TikaCoreProperties.RESOURCE_NAME_KEY, multipartFile.getName());
-                InputStream inputStream = new BufferedInputStream(multipartFile.getInputStream());
-                org.apache.tika.mime.MediaType mediaType = detector.detect(inputStream, metadata);
-                String type = mediaType.getBaseType().toString().toLowerCase();
-                if (type.contains("heic") || type.contains("heif")) {
-                    throw new IllegalArgumentException("Encountered HEIC file in attachments upload");
-                }
-                attachmentFiles.add(new OlogMultipartFile(multipartFile, inputStream));
-            } catch (IOException e) {
-                logger.log(Level.WARNING, "Failed to read multipart file stream or determine file content", e);
-                throw new RuntimeException(e);
-            }
+            String originalFileName = multipartFile.getOriginalFilename();
+            Optional<Attachment> attachment =
+                    logEntry.getAttachments().stream()
+                            .filter(a -> a.getFilename() != null && a.getFilename().equals(originalFileName)).findFirst();
+            savedAttachments.add(saveAttachment(multipartFile,
+                    originalFileName,
+                    attachment.get().getId(),
+                    attachment.get().getFileMetadataDescription()));
         }
-        return attachmentFiles;
+
+        return savedAttachments;
     }
 
-    /**
-     * Checks that attachment upload is consistent with the log entry attachments part:
-     * <ul>
-     *     <li>Multipart file count must be equal to attachment count.</li>
-     *     <li>For each multipart file the original file name must match exactly one attachment's filename.</li>
-     * </ul>
-     *
-     * @param logEntry       Log entry with attachments
-     * @param multipartFiles An array of {@link MultipartFile}s as provided by the web layer.
-     * @return <code>true</code> if attachments data is consistent, otherwise <code>false</code>
-     */
-    protected boolean isAttachmentUploadConsistent(Log logEntry, MultipartFile[] multipartFiles) {
-
-        if (multipartFiles != null && multipartFiles.length == logEntry.getAttachments().size()) {
-            for (MultipartFile multipartFile : multipartFiles) {
-                String originalFileName = multipartFile.getOriginalFilename();
-
-                List<Attachment> attachment =
-                        logEntry.getAttachments().stream()
-                                .filter(a -> a.getFilename() != null && a.getFilename().equals(originalFileName)).toList();
-                if (attachment.size() != 1) { // Should not happen if client behaves correctly
-                    logger.log(Level.WARNING, () -> MessageFormat.format(TextUtil.ATTACHMENT_FILE_NOT_MATCHED_META_DATA, originalFileName));
-                    return false;
-                }
-            }
-            return true;
-        } else {
-            return multipartFiles == null && logEntry.getAttachments().isEmpty();
-        }
-    }
-
-    /**
-         * A {@link MultipartFile} implementation with the purpose of providing a custom {@link InputStream}.
-         */
-        private record OlogMultipartFile(MultipartFile originalMultipartFile,
-                                         InputStream inputStream) implements MultipartFile {
-
-        @Override
-            public String getName() {
-                return originalMultipartFile.getName();
-            }
-
-            @Override
-            public String getOriginalFilename() {
-                return originalMultipartFile.getOriginalFilename();
-            }
-
-            @Override
-            public String getContentType() {
-                return originalMultipartFile.getContentType();
-            }
-
-            @Override
-            public boolean isEmpty() {
-                return originalMultipartFile.isEmpty();
-            }
-
-            @Override
-            public long getSize() {
-                return originalMultipartFile.getSize();
-            }
-
-            @Override
-            public byte[] getBytes() throws IOException {
-                return originalMultipartFile.getBytes();
-            }
-
-            @Override
-            public InputStream getInputStream() {
-                return inputStream;
-            }
-
-            @Override
-            public void transferTo(File dest) throws IOException, IllegalStateException {
-                originalMultipartFile.transferTo(dest);
-            }
-        }
 
 }
